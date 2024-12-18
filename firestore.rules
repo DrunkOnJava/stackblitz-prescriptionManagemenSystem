@@ -1,0 +1,139 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===== Helper Functions =====
+    
+    // Authentication checks
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isProvider() {
+      return isAuthenticated() && 
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'provider';
+    }
+
+    // Data validation helpers
+    function isValidPrescription() {
+      let data = request.resource.data;
+      return data.keys().hasAll([
+        'product', 'weeklyDosage', 'tier', 'price', 'status', 'patientId', 'providerId'
+      ]) &&
+      data.product is string &&
+      data.weeklyDosage is string &&
+      data.tier is string &&
+      data.price is string &&
+      data.status in ['active', 'pending', 'completed'] &&
+      data.patientId is string &&
+      data.providerId is string;
+    }
+
+    function isValidPatient() {
+      let data = request.resource.data;
+      return data.keys().hasAll(['name', 'status', 'contactInfo']) &&
+      data.name is string &&
+      data.name.size() > 0 &&
+      data.status in ['active', 'inactive', 'pending'] &&
+      data.contactInfo is string;
+    }
+
+    function isValidActivity() {
+      let data = request.resource.data;
+      return data.keys().hasAll([
+        'type', 'description', 'patientId', 'patientName', 'performedBy', 'timestamp'
+      ]) &&
+      data.type in [
+        'patient_created', 'patient_updated', 'patient_deleted',
+        'prescription_created', 'prescription_updated', 'prescription_deleted',
+        'refill_requested', 'refill_approved', 'refill_denied'
+      ] &&
+      data.description is string &&
+      data.patientId is string &&
+      data.patientName is string &&
+      data.performedBy is string &&
+      data.timestamp is string;
+    }
+
+    // Rate limiting
+    function notRateLimited() {
+      let recentWrites = getRecentWrites(1800); // 30 minutes
+      return recentWrites < 1000;
+    }
+
+    function getRecentWrites(seconds) {
+      let writes = getCountFromPath("writes");
+      let recentWrites = writes.where("timestamp", ">=", request.time.toMillis() - seconds * 1000).count();
+      return recentWrites;
+    }
+
+    // ===== Collection Rules =====
+
+    // Patient rules
+    match /patients/{patientId} {
+      allow read: if isAuthenticated();
+      allow create: if isProvider() && 
+                      isValidPatient() && 
+                      notRateLimited();
+      allow update: if isProvider() && 
+                      isValidPatient() && 
+                      notRateLimited();
+      allow delete: if isProvider() && notRateLimited();
+      
+      // Nested prescriptions collection
+      match /prescriptions/{prescriptionId} {
+        allow read: if isAuthenticated();
+        allow write: if isProvider() && 
+                       isValidPrescription() && 
+                       notRateLimited() &&
+                       request.resource.data.patientId == patientId;
+      }
+    }
+    
+    // Activity rules
+    match /activities/{activityId} {
+      allow read: if isAuthenticated();
+      allow write: if isProvider();
+    }
+    
+    // Messages rules
+    match /messages/{messageId} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == resource.data.providerId ||
+        request.auth.uid == resource.data.patientId
+      );
+      allow create: if isAuthenticated();
+      allow update: if isProvider() && resource.data.providerId == request.auth.uid;
+      allow delete: if false; // Messages should never be deleted
+    }
+    
+    // Refill requests rules
+    match /refill_requests/{requestId} {
+      allow read: if isAuthenticated() && (
+        request.auth.uid == resource.data.providerId ||
+        request.auth.uid == resource.data.patientId
+      );
+      allow create: if isAuthenticated();
+      allow update: if isProvider() && resource.data.providerId == request.auth.uid;
+      allow delete: if false; // Refill requests should never be deleted
+    }
+    
+    // User rules
+    match /users/{userId} {
+      allow read: if isAuthenticated() && 
+                    (request.auth.uid == userId || isProvider());
+      allow write: if isProvider() || request.auth.uid == userId;
+      
+      // Rate limit user profile updates
+      allow update: if (isProvider() || request.auth.uid == userId) && 
+                      notRateLimited();
+    }
+
+    // System configuration
+    match /system/{document=**} {
+      allow read: if isProvider();
+      allow write: if false; // System config is read-only
+    }
+  }
+}
